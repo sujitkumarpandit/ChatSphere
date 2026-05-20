@@ -13,57 +13,79 @@ import {
   serverTimestamp,
   onSnapshot,
 } from 'firebase/firestore'
+
 import { db } from '@/lib/firebase'
 import { Conversation, Message } from '@/types/chat'
 
 const conversationsCollection = collection(db, 'conversations')
-const messagesCollection = collection(db, 'messages')
 
-function generateConversationId(userId1: string, userId2: string): string {
-  const sorted = [userId1, userId2].sort()
-  return `${sorted[0]}_${sorted[1]}`
+function generateConversationId(
+  userId1: string,
+  userId2: string
+): string {
+  return [userId1, userId2].sort().join('_')
 }
 
 export const chatService = {
-  async getOrCreateConversation(currentUserId: string, otherUserId: string): Promise<Conversation> {
-    const conversationId = generateConversationId(currentUserId, otherUserId)
-    const docSnap = await getDoc(doc(conversationsCollection, conversationId))
+  // CREATE OR GET CONVERSATION
+  async getOrCreateConversation(
+    currentUserId: string,
+    otherUserId: string
+  ): Promise<Conversation> {
+    const conversationId = generateConversationId(
+      currentUserId,
+      otherUserId
+    )
 
+    const conversationRef = doc(
+      conversationsCollection,
+      conversationId
+    )
+
+    const docSnap = await getDoc(conversationRef)
+
+    // EXISTING CONVERSATION
     if (docSnap.exists()) {
       const data = docSnap.data()
+
       return {
         id: docSnap.id,
-        participants: data.participants,
-        participantIds: data.participantIds,
+        participants: data.participants || [],
+        participantIds: data.participantIds || {},
         lastMessage: data.lastMessage || '',
-        lastMessageTime: data.lastMessageTime?.toDate() || new Date(),
+        lastMessageTime:
+          data.lastMessageTime?.toDate() || new Date(),
         createdAt: data.createdAt?.toDate() || new Date(),
         unreadCount: data.unreadCount || 0,
       }
     }
 
-    const now = serverTimestamp()
+    // CREATE NEW CONVERSATION
     const conversationData = {
       participants: [currentUserId, otherUserId],
+
       participantIds: {
         [currentUserId]: currentUserId,
         [otherUserId]: otherUserId,
       },
+
       lastMessage: '',
-      lastMessageTime: now,
-      createdAt: now,
+      lastMessageTime: serverTimestamp(),
+      createdAt: serverTimestamp(),
       unreadCount: 0,
     }
 
-    await setDoc(doc(conversationsCollection, conversationId), conversationData)
+    await setDoc(conversationRef, conversationData)
 
     return {
       id: conversationId,
       participants: [currentUserId, otherUserId],
+
       participantIds: {
         [currentUserId]: currentUserId,
         [otherUserId]: otherUserId,
       },
+
       lastMessage: '',
       lastMessageTime: new Date(),
       createdAt: new Date(),
@@ -71,142 +93,280 @@ export const chatService = {
     }
   },
 
-  async sendMessage(conversationId: string, senderId: string, senderUsername: string, encryptedContent: string): Promise<string> {
-    const messageData = {
-      conversationId,
-      senderId,
-      senderUsername,
-      encryptedContent,
-      chatId: conversationId,
-      createdAt: serverTimestamp(),
-      // Back-compat for any older documents / UI mapping
-      timestamp: serverTimestamp(),
-      status: 'sent' as const,
+  // SEND MESSAGE
+  async sendMessage(
+    conversationId: string,
+    senderId: string,
+    senderUsername: string,
+    encryptedContent: string
+  ): Promise<string> {
+    try {
+      // SAVE MESSAGE INSIDE CONVERSATION SUBCOLLECTION
+      const messagesRef = collection(
+        db,
+        'conversations',
+        conversationId,
+        'messages'
+      )
+
+      const messageData = {
+        conversationId,
+        senderId,
+        senderUsername,
+        encryptedContent,
+
+        createdAt: serverTimestamp(),
+
+        status: 'sent',
+      }
+
+      const docRef = await addDoc(
+        messagesRef,
+        messageData
+      )
+
+      // UPDATE LAST MESSAGE
+      await updateDoc(
+        doc(conversationsCollection, conversationId),
+        {
+          lastMessage: encryptedContent,
+          lastMessageTime: serverTimestamp(),
+        }
+      )
+
+      return docRef.id
+    } catch (error) {
+      console.error('Send message error:', error)
+      throw error
     }
-
-
-    const docRef = await addDoc(messagesCollection, messageData)
-
-    await updateDoc(doc(conversationsCollection, conversationId), {
-      lastMessage: '[Encrypted message]',
-      lastMessageTime: serverTimestamp(),
-    })
-
-    return docRef.id
   },
 
-  async getMessages(conversationId: string, limitCount: number = 50): Promise<Message[]> {
-    const q = query(
-      collection(db, `conversations/${conversationId}/messages`),
-      orderBy('createdAt', 'desc'),
-      limit(limitCount)
-    )
+  // GET MESSAGES
+  async getMessages(
+    conversationId: string,
+    limitCount: number = 50
+  ): Promise<Message[]> {
+    try {
+      const messagesRef = collection(
+        db,
+        'conversations',
+        conversationId,
+        'messages'
+      )
 
+      const q = query(
+        messagesRef,
+        orderBy('createdAt', 'asc'),
+        limit(limitCount)
+      )
 
-    const querySnapshot = await getDocs(q)
-    return querySnapshot.docs
-      .map((doc) => {
+      const querySnapshot = await getDocs(q)
+
+      return querySnapshot.docs.map((doc) => {
         const data = doc.data()
-          return {
-            id: doc.id,
-            conversationId,
-            senderId: data.senderId,
-            senderUsername: data.senderUsername,
-            encryptedContent: data.encryptedContent,
-            timestamp: data.createdAt?.toDate() || data.timestamp?.toDate?.() || new Date(),
-            status: data.status || 'sent',
-          }
 
+        return {
+          id: doc.id,
+          conversationId,
+
+          senderId: data.senderId,
+          senderUsername: data.senderUsername,
+
+          encryptedContent: data.encryptedContent,
+
+          timestamp:
+            data.createdAt?.toDate() || new Date(),
+
+          status: data.status || 'sent',
+        }
       })
-      .reverse()
+    } catch (error) {
+      console.error('Get messages error:', error)
+      return []
+    }
   },
 
+  // REALTIME MESSAGE SUBSCRIPTION
   subscribeToMessages(
-
     conversationId: string,
     callback: (messages: Message[]) => void,
     limitCount: number = 50
   ): () => void {
+    const messagesRef = collection(
+      db,
+      'conversations',
+      conversationId,
+      'messages'
+    )
+
     const q = query(
-      collection(db, `conversations/${conversationId}/messages`),
-      orderBy('createdAt', 'desc'),
+      messagesRef,
+      orderBy('createdAt', 'asc'),
       limit(limitCount)
     )
 
-    const unsubscribe = onSnapshot(q, (querySnapshot) => {
-      const messages = querySnapshot.docs
-        .map((doc) => {
-          const data = doc.data()
-          return {
-            id: doc.id,
-            conversationId,
-            senderId: data.senderId,
-            senderUsername: data.senderUsername,
-            encryptedContent: data.encryptedContent,
-            timestamp: data.createdAt?.toDate() || data.timestamp?.toDate?.() || new Date(),
-            status: data.status || 'sent',
-          }
+    const unsubscribe = onSnapshot(
+      q,
+      (querySnapshot) => {
+        const messages: Message[] =
+          querySnapshot.docs.map((doc) => {
+            const data = doc.data()
 
-        })
-        .reverse()
+            return {
+              id: doc.id,
+              conversationId,
 
-      callback(messages)
-    })
+              senderId: data.senderId,
+              senderUsername: data.senderUsername,
+
+              encryptedContent:
+                data.encryptedContent,
+
+              timestamp:
+                data.createdAt?.toDate() ||
+                new Date(),
+
+              status: data.status || 'sent',
+            }
+          })
+
+        callback(messages)
+      },
+      (error) => {
+        console.error(
+          'Realtime messages error:',
+          error
+        )
+      }
+    )
 
     return unsubscribe
   },
 
-  async updateMessageStatus(conversationId: string, messageId: string, status: 'delivered' | 'seen'): Promise<void> {
-    await updateDoc(doc(db, `conversations/${conversationId}/messages/${messageId}`), {
-      status,
-    })
+  // UPDATE MESSAGE STATUS
+  async updateMessageStatus(
+    conversationId: string,
+    messageId: string,
+    status: 'delivered' | 'seen'
+  ): Promise<void> {
+    try {
+      await updateDoc(
+        doc(
+          db,
+          'conversations',
+          conversationId,
+          'messages',
+          messageId
+        ),
+        {
+          status,
+        }
+      )
+    } catch (error) {
+      console.error(
+        'Update message status error:',
+        error
+      )
+    }
   },
 
-  async getUserConversations(userId: string): Promise<Conversation[]> {
-    const q = query(
-      conversationsCollection,
-      where('participants', 'array-contains', userId),
-      orderBy('lastMessageTime', 'desc')
-    )
+  // GET USER CONVERSATIONS
+  async getUserConversations(
+    userId: string
+  ): Promise<Conversation[]> {
+    try {
+      const q = query(
+        conversationsCollection,
+        where('participants', 'array-contains', userId),
+        orderBy('lastMessageTime', 'desc')
+      )
 
-    const querySnapshot = await getDocs(q)
-    return querySnapshot.docs.map((doc) => {
-      const data = doc.data()
-      return {
-        id: doc.id,
-        participants: data.participants,
-        participantIds: data.participantIds,
-        lastMessage: data.lastMessage || '',
-        lastMessageTime: data.lastMessageTime?.toDate() || new Date(),
-        createdAt: data.createdAt?.toDate() || new Date(),
-        unreadCount: data.unreadCount || 0,
-      }
-    })
-  },
+      const querySnapshot = await getDocs(q)
 
-  subscribeToConversations(userId: string, callback: (conversations: Conversation[]) => void): () => void {
-    const q = query(
-      conversationsCollection,
-      where('participants', 'array-contains', userId),
-      orderBy('lastMessageTime', 'desc')
-    )
-
-    const unsubscribe = onSnapshot(q, (querySnapshot) => {
-      const conversations = querySnapshot.docs.map((doc) => {
+      return querySnapshot.docs.map((doc) => {
         const data = doc.data()
+
         return {
           id: doc.id,
-          participants: data.participants,
-          participantIds: data.participantIds,
+
+          participants: data.participants || [],
+          participantIds: data.participantIds || {},
+
           lastMessage: data.lastMessage || '',
-          lastMessageTime: data.lastMessageTime?.toDate() || new Date(),
-          createdAt: data.createdAt?.toDate() || new Date(),
+
+          lastMessageTime:
+            data.lastMessageTime?.toDate() ||
+            new Date(),
+
+          createdAt:
+            data.createdAt?.toDate() ||
+            new Date(),
+
           unreadCount: data.unreadCount || 0,
         }
       })
+    } catch (error) {
+      console.error(
+        'Get conversations error:',
+        error
+      )
 
-      callback(conversations)
-    })
+      return []
+    }
+  },
+
+  // REALTIME CONVERSATIONS
+  subscribeToConversations(
+    userId: string,
+    callback: (conversations: Conversation[]) => void
+  ): () => void {
+    const q = query(
+      conversationsCollection,
+      where('participants', 'array-contains', userId),
+      orderBy('lastMessageTime', 'desc')
+    )
+
+    const unsubscribe = onSnapshot(
+      q,
+      (querySnapshot) => {
+        const conversations: Conversation[] =
+          querySnapshot.docs.map((doc) => {
+            const data = doc.data()
+
+            return {
+              id: doc.id,
+
+              participants:
+                data.participants || [],
+
+              participantIds:
+                data.participantIds || {},
+
+              lastMessage:
+                data.lastMessage || '',
+
+              lastMessageTime:
+                data.lastMessageTime?.toDate() ||
+                new Date(),
+
+              createdAt:
+                data.createdAt?.toDate() ||
+                new Date(),
+
+              unreadCount:
+                data.unreadCount || 0,
+            }
+          })
+
+        callback(conversations)
+      },
+      (error) => {
+        console.error(
+          'Realtime conversations error:',
+          error
+        )
+      }
+    )
 
     return unsubscribe
   },
