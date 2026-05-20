@@ -43,3 +43,8 @@ firebase-debug.log
 
 # Production
 dist/
+
+
+node_modules
+.next
+.env
