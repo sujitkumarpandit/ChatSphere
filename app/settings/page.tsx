@@ -125,7 +125,7 @@ export default function SettingsPage() {
 
             {notificationsEnabled && (
               <p className="text-xs text-gray-500 dark:text-gray-400 mt-2">
-                You'll receive notifications for new messages. Messages will not be shown in notifications for privacy.
+                You&apos;ll receive notifications for new messages. Messages will not be shown in notifications for privacy.
               </p>
             )}
           </div>
